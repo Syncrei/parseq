@@ -62,6 +62,7 @@ class LmdbDataset(Dataset):
         max_label_len: int,
         min_image_dim: int = 0,
         remove_whitespace: bool = True,
+        to_upper: bool = False,
         normalize_unicode: bool = True,
         unlabelled: bool = False,
         transform: Optional[Callable] = None,
@@ -73,7 +74,7 @@ class LmdbDataset(Dataset):
         self.labels = []
         self.filtered_index_list = []
         self.num_samples = self._preprocess_labels(
-            charset, remove_whitespace, normalize_unicode, max_label_len, min_image_dim
+            charset, remove_whitespace, to_upper, normalize_unicode, max_label_len, min_image_dim
         )
 
     def __del__(self):
@@ -92,7 +93,7 @@ class LmdbDataset(Dataset):
             self._env = self._create_env()
         return self._env
 
-    def _preprocess_labels(self, charset, remove_whitespace, normalize_unicode, max_label_len, min_image_dim):
+    def _preprocess_labels(self, charset, remove_whitespace, to_upper, normalize_unicode, max_label_len, min_image_dim):
         charset_adapter = CharsetAdapter(charset)
         with self._create_env() as env, env.begin() as txn:
             num_samples = int(txn.get('num-samples'.encode()))
@@ -105,6 +106,11 @@ class LmdbDataset(Dataset):
                 # Normally, whitespace is removed from the labels.
                 if remove_whitespace:
                     label = ''.join(label.split())
+                # Cast letter to upper case
+                if to_upper:
+                    label = label.upper()
+                label = label.strip()
+                label = ' '.join(label.split())
                 # Normalize unicode composites (if any) and convert to compatible ASCII characters
                 if normalize_unicode:
                     label = unicodedata.normalize('NFKD', label).encode('ascii', 'ignore').decode()
@@ -113,8 +119,10 @@ class LmdbDataset(Dataset):
                     continue
                 label = charset_adapter(label)
                 # We filter out samples which don't contain any supported characters
-                if not label:
-                    continue
+
+                # if not label:
+                #     continue
+
                 # Filter images that are too small.
                 if min_image_dim > 0:
                     img_key = f'image-{index:09d}'.encode()

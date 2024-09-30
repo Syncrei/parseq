@@ -41,6 +41,7 @@ class SceneTextDataModule(pl.LightningDataModule):
         batch_size: int,
         num_workers: int,
         augment: bool,
+        to_upper: bool = False,
         remove_whitespace: bool = True,
         normalize_unicode: bool = True,
         min_image_dim: int = 0,
@@ -57,6 +58,7 @@ class SceneTextDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.augment = augment
+        self.to_upper = to_upper
         self.remove_whitespace = remove_whitespace
         self.normalize_unicode = normalize_unicode
         self.min_image_dim = min_image_dim
@@ -92,6 +94,7 @@ class SceneTextDataModule(pl.LightningDataModule):
                 self.max_label_length,
                 self.min_image_dim,
                 self.remove_whitespace,
+                self.to_upper,
                 self.normalize_unicode,
                 transform=transform,
             )
@@ -101,13 +104,14 @@ class SceneTextDataModule(pl.LightningDataModule):
     def val_dataset(self):
         if self._val_dataset is None:
             transform = self.get_transform(self.img_size)
-            root = PurePath(self.root_dir, 'val')
+            root = PurePath(self.root_dir, 'custom_val')
             self._val_dataset = build_tree_dataset(
                 root,
                 self.charset_test,
                 self.max_label_length,
                 self.min_image_dim,
                 self.remove_whitespace,
+                self.to_upper,
                 self.normalize_unicode,
                 transform=transform,
             )
@@ -144,6 +148,7 @@ class SceneTextDataModule(pl.LightningDataModule):
                 self.max_label_length,
                 self.min_image_dim,
                 self.remove_whitespace,
+                self.to_upper,
                 self.normalize_unicode,
                 transform=transform,
             )
