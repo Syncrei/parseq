@@ -18,18 +18,24 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
 
-from nltk import edit_distance
-
+import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+from nltk import edit_distance
+from pytorch_lightning.utilities.types import STEP_OUTPUT
+from timm.optim import create_optimizer_v2
 from torch import Tensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import OneCycleLR
+from torchmetrics import MetricCollection
+from torchmetrics.text import (
+    CharErrorRate,
+    ExtendedEditDistance,
+    MatchErrorRate,
+    WordErrorRate,
+)
 
-import pytorch_lightning as pl
-from pytorch_lightning.utilities.types import STEP_OUTPUT
-from timm.optim import create_optimizer_v2
-
+import wandb
 from strhub.data.utils import BaseTokenizer, CharsetAdapter, CTCTokenizer, Tokenizer
 
 
@@ -48,7 +54,6 @@ EPOCH_OUTPUT = list[dict[str, BatchResult]]
 
 
 class BaseSystem(pl.LightningModule, ABC):
-
     def __init__(
         self,
         tokenizer: BaseTokenizer,
@@ -66,6 +71,21 @@ class BaseSystem(pl.LightningModule, ABC):
         self.warmup_pct = warmup_pct
         self.weight_decay = weight_decay
         self.outputs: EPOCH_OUTPUT = []
+        self.metrics = self._init_metrics()
+
+    def _init_metrics(self):
+        metrics = {
+            "CharErrorRate": CharErrorRate(),
+            "ExtendedEditDistance": ExtendedEditDistance(),
+            "MatchErrorRate": MatchErrorRate(),
+            "WordErrorRate": WordErrorRate(),
+        }
+        metric_collection = MetricCollection(metrics)
+
+        return torch.nn.ModuleDict({
+            "train_metrics": metric_collection.clone(prefix="train_"),
+            "val_metrics": metric_collection.clone(prefix="val_"),
+        })
 
     @abstractmethod
     def forward(self, images: Tensor, max_length: Optional[int] = None) -> Tensor:
@@ -100,11 +120,15 @@ class BaseSystem(pl.LightningModule, ABC):
         # Linear scaling so that the effective learning rate is constant regardless of the number of GPUs used with DDP.
         lr_scale = agb * math.sqrt(self.trainer.num_devices) * self.batch_size / 256.0
         lr = lr_scale * self.lr
-        optim = create_optimizer_v2(self, 'adamw', lr, self.weight_decay)
+        optim = create_optimizer_v2(self, "adamw", lr, self.weight_decay)
         sched = OneCycleLR(
-            optim, lr, self.trainer.estimated_stepping_batches, pct_start=self.warmup_pct, cycle_momentum=False
+            optim,
+            lr,
+            self.trainer.estimated_stepping_batches,
+            pct_start=self.warmup_pct,
+            cycle_momentum=False,
         )
-        return {'optimizer': optim, 'lr_scheduler': {'scheduler': sched, 'interval': 'step'}}
+        return {"optimizer": optim, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
 
     def optimizer_zero_grad(self, epoch: int, batch_idx: int, optimizer: Optimizer) -> None:
         optimizer.zero_grad(set_to_none=True)
@@ -135,12 +159,21 @@ class BaseSystem(pl.LightningModule, ABC):
             confidence += prob.prod().item()
             pred = self.charset_adapter(pred)
             # Follow ICDAR 2019 definition of N.E.D.
+            if max(len(pred), len(gt)) == 0:
+                continue
+
             ned += edit_distance(pred, gt) / max(len(pred), len(gt))
             if pred == gt:
                 correct += 1
             total += 1
             label_length += len(pred)
-        return dict(output=BatchResult(total, correct, ned, confidence, label_length, loss, loss_numel))
+
+        self.metrics["val_metrics"](preds, labels)
+        return {
+            "output": BatchResult(total, correct, ned, confidence, label_length, loss, loss_numel),
+            "pred": preds,
+            "gt": labels,
+        }
 
     @staticmethod
     def _aggregate_results(outputs: EPOCH_OUTPUT) -> tuple[float, float, float]:
@@ -152,7 +185,7 @@ class BaseSystem(pl.LightningModule, ABC):
         total_norm_ED = 0
         total_size = 0
         for result in outputs:
-            result = result['output']
+            result = result["output"]
             total_loss += result.loss_numel * result.loss
             total_loss_numel += result.loss_numel
             total_n_correct += result.correct
@@ -168,22 +201,39 @@ class BaseSystem(pl.LightningModule, ABC):
         self.outputs.append(result)
         return result
 
+    def _log_comparison_table(self) -> None:
+        y_gt = [x for res in self.outputs for x in res["gt"]]
+        y_pred = [x for res in self.outputs for x in res["pred"]]
+
+        table = wandb.Table(columns=["gt", "pred"])
+        for gt, pred in zip(y_gt, y_pred):
+            table.add_data(f"'{gt}'", f"'{pred}'")
+        wandb.log({"Comparison Table": table})
+
     def on_validation_epoch_end(self) -> None:
+        self._log_comparison_table()
         acc, ned, loss = self._aggregate_results(self.outputs)
+
         self.outputs.clear()
-        self.log('val_accuracy', 100 * acc, sync_dist=True)
-        self.log('val_NED', 100 * ned, sync_dist=True)
-        self.log('val_loss', loss, sync_dist=True)
-        self.log('hp_metric', acc, sync_dist=True)
+        self.log("val_accuracy", 100 * acc, sync_dist=True)
+        self.log("val_NED", 100 * ned, sync_dist=True)
+        self.log("val_loss", loss, sync_dist=True)
+        self.log("hp_metric", acc, sync_dist=True)
+        self.log_dict(self.metrics["val_metrics"])
 
     def test_step(self, batch, batch_idx) -> Optional[STEP_OUTPUT]:
         return self._eval_step(batch, False)
 
 
 class CrossEntropySystem(BaseSystem):
-
     def __init__(
-        self, charset_train: str, charset_test: str, batch_size: int, lr: float, warmup_pct: float, weight_decay: float
+        self,
+        charset_train: str,
+        charset_test: str,
+        batch_size: int,
+        lr: float,
+        warmup_pct: float,
+        weight_decay: float,
     ) -> None:
         tokenizer = Tokenizer(charset_train)
         super().__init__(tokenizer, charset_test, batch_size, lr, warmup_pct, weight_decay)
@@ -196,15 +246,22 @@ class CrossEntropySystem(BaseSystem):
         targets = targets[:, 1:]  # Discard <bos>
         max_len = targets.shape[1] - 1  # exclude <eos> from count
         logits = self.forward(images, max_len)
-        loss = F.cross_entropy(logits.flatten(end_dim=1), targets.flatten(), ignore_index=self.pad_id)
+        loss = F.cross_entropy(
+            logits.flatten(end_dim=1), targets.flatten(), ignore_index=self.pad_id
+        )
         loss_numel = (targets != self.pad_id).sum()
         return logits, loss, loss_numel
 
 
 class CTCSystem(BaseSystem):
-
     def __init__(
-        self, charset_train: str, charset_test: str, batch_size: int, lr: float, warmup_pct: float, weight_decay: float
+        self,
+        charset_train: str,
+        charset_test: str,
+        batch_size: int,
+        lr: float,
+        warmup_pct: float,
+        weight_decay: float,
     ) -> None:
         tokenizer = CTCTokenizer(charset_train)
         super().__init__(tokenizer, charset_test, batch_size, lr, warmup_pct, weight_decay)
@@ -216,6 +273,15 @@ class CTCSystem(BaseSystem):
         log_probs = logits.log_softmax(-1).transpose(0, 1)  # swap batch and seq. dims
         T, N, _ = log_probs.shape
         input_lengths = torch.full(size=(N,), fill_value=T, dtype=torch.long, device=self.device)
-        target_lengths = torch.as_tensor(list(map(len, labels)), dtype=torch.long, device=self.device)
-        loss = F.ctc_loss(log_probs, targets, input_lengths, target_lengths, blank=self.blank_id, zero_infinity=True)
+        target_lengths = torch.as_tensor(
+            list(map(len, labels)), dtype=torch.long, device=self.device
+        )
+        loss = F.ctc_loss(
+            log_probs,
+            targets,
+            input_lengths,
+            target_lengths,
+            blank=self.blank_id,
+            zero_infinity=True,
+        )
         return logits, loss, N

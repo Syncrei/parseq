@@ -23,15 +23,21 @@ from omegaconf import DictConfig, open_dict
 import torch
 
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, StochasticWeightAveraging
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks import ModelCheckpoint, StochasticWeightAveraging, LearningRateMonitor
+from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.utilities.model_summary import summarize
 
 from strhub.data.module import SceneTextDataModule
 from strhub.models.base import BaseSystem
-from strhub.models.utils import get_pretrained_weights
+from strhub.models.utils import get_pretrained_weights, load_from_checkpoint
 
+import os
+import time
+os.environ['TZ'] = 'Europe/Minsk'
+time.tzset()
+
+torch.set_float32_matmul_precision('high')
 
 # Copied from OneCycleLR
 def _annealing_cos(start, end, pct):
@@ -61,7 +67,8 @@ def main(config: DictConfig):
         devices = config.trainer.get('devices', 0)
         if gpu:
             # Use mixed-precision training
-            config.trainer.precision = 'bf16-mixed' if torch.get_autocast_gpu_dtype() is torch.bfloat16 else '16-mixed'
+            config.trainer.precision = 'bf16-mixed' if torch.get_autocast_dtype("cuda") is torch.bfloat16 else '16-mixed'
+            # config.trainer.precision = 'bf16-true'
         if gpu and devices > 1:
             # Use DDP with optimizations
             trainer_strategy = DDPStrategy(find_unused_parameters=False, gradient_as_bucket_view=True)
@@ -79,31 +86,37 @@ def main(config: DictConfig):
     if config.pretrained is not None:
         m = model.model if config.model._target_.endswith('PARSeq') else model
         m.load_state_dict(get_pretrained_weights(config.pretrained))
+    if config.pretrained_path is not None:
+        model = load_from_checkpoint(config.pretrained_path)
     print(summarize(model, max_depth=2))
 
     datamodule: SceneTextDataModule = hydra.utils.instantiate(config.data)
 
+    swa_epoch_start = 0.75
+    swa_lr = config.model.lr * get_swa_lr_factor(config.model.warmup_pct, swa_epoch_start)
+    swa = StochasticWeightAveraging(swa_lr, swa_epoch_start)
+    lr_monitor = LearningRateMonitor(logging_interval='step')
+    cwd = (
+        HydraConfig.get().runtime.output_dir
+        if config.ckpt_path is None
+        else str(Path(config.ckpt_path).parents[1].absolute())
+    )
+
     checkpoint = ModelCheckpoint(
+        dirpath=cwd,
         monitor='val_accuracy',
         mode='max',
         save_top_k=3,
         save_last=True,
         filename='{epoch}-{step}-{val_accuracy:.4f}-{val_NED:.4f}',
     )
-    swa_epoch_start = 0.75
-    swa_lr = config.model.lr * get_swa_lr_factor(config.model.warmup_pct, swa_epoch_start)
-    swa = StochasticWeightAveraging(swa_lr, swa_epoch_start)
-    cwd = (
-        HydraConfig.get().runtime.output_dir
-        if config.ckpt_path is None
-        else str(Path(config.ckpt_path).parents[1].absolute())
-    )
+
     trainer: Trainer = hydra.utils.instantiate(
         config.trainer,
-        logger=TensorBoardLogger(cwd, '', '.'),
+        logger=WandbLogger(project='ocr', name=f'parseq-256 | {time.strftime("%Y-%m-%d %H:%M")}'),
         strategy=trainer_strategy,
         enable_model_summary=False,
-        callbacks=[checkpoint, swa],
+        callbacks=[checkpoint, swa, lr_monitor],
     )
     trainer.fit(model, datamodule=datamodule, ckpt_path=config.ckpt_path)
 
