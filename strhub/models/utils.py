@@ -90,6 +90,7 @@ def load_from_checkpoint(checkpoint_path: str, **kwargs):
     else:
         ModelClass = _get_model_class(checkpoint_path)
         model = ModelClass.load_from_checkpoint(checkpoint_path, **kwargs)
+    print("Loaded model from checkpoint: ", checkpoint_path)
     return model
 
 

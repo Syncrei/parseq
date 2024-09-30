@@ -1,0 +1,27 @@
+# @package _global_
+defaults:
+  - override /model: parseq
+
+model:
+  name: parseq256
+  img_size: [ 32, 256]  # [ height, width ]
+  patch_size: [ 4, 8]  # [ height, width ]
+  max_label_length: 25
+  charset_train: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~° "
+  # For charset_test, ordering doesn't matter.
+  charset_test: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~° "
+  batch_size: 200
+
+data:
+  train_dir: "custom"
+  remove_whitespace: false
+  to_upper: true
+  num_workers: 6
+
+trainer:
+  devices: 1
+  val_check_interval: 50
+  max_epochs: 5
+
+pretrained_path: "model_weights/parseq_base_checkpoint.ckpt"
+# pretrained: true
