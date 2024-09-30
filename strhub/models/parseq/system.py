@@ -18,12 +18,10 @@ from itertools import permutations
 from typing import Any, Optional, Sequence
 
 import numpy as np
-
 import torch
 import torch.nn.functional as F
-from torch import Tensor
-
 from pytorch_lightning.utilities.types import STEP_OUTPUT
+from torch import Tensor
 
 from strhub.models.base import CrossEntropySystem
 
@@ -31,7 +29,6 @@ from .model import PARSeq as Model
 
 
 class PARSeq(CrossEntropySystem):
-
     def __init__(
         self,
         charset_train: str,
@@ -62,6 +59,7 @@ class PARSeq(CrossEntropySystem):
         self.save_hyperparameters()
 
         self.model = Model(
+            self.tokenizer,
             len(self.tokenizer),
             max_label_length,
             img_size,
@@ -85,7 +83,7 @@ class PARSeq(CrossEntropySystem):
         self.perm_mirrored = perm_mirrored
 
     def forward(self, images: Tensor, max_length: Optional[int] = None) -> Tensor:
-        return self.model.forward(self.tokenizer, images, max_length)
+        return self.model.forward(images, max_length)
 
     def gen_tgt_perms(self, tgt):
         """Generate shared permutations for the whole batch.

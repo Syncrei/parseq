@@ -18,9 +18,8 @@ from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
-from torch import Tensor
-
 from timm.models.helpers import named_apply
+from torch import Tensor
 
 from strhub.data.utils import Tokenizer
 from strhub.models.utils import init_weights
@@ -29,9 +28,9 @@ from .modules import Decoder, DecoderLayer, Encoder, TokenEmbedding
 
 
 class PARSeq(nn.Module):
-
     def __init__(
         self,
+        tokenizer: Tokenizer,
         num_tokens: int,
         max_label_length: int,
         img_size: Sequence[int],
@@ -49,6 +48,9 @@ class PARSeq(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.pad_id = tokenizer.pad_id
+        self.eos_id = tokenizer.eos_id
+        self.bos_id = tokenizer.bos_id
         self.max_label_length = max_label_length
         self.decode_ar = decode_ar
         self.refine_iters = refine_iters
@@ -70,9 +72,9 @@ class PARSeq(nn.Module):
         named_apply(partial(init_weights, exclude=['encoder']), self)
         nn.init.trunc_normal_(self.pos_queries, std=0.02)
 
-    @property
-    def _device(self) -> torch.device:
-        return next(self.head.parameters(recurse=False)).device
+    def get_device(self) -> torch.device:
+        return self.pos_queries.device
+        # return next(self.head.parameters(recurse=False)).device
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -102,7 +104,7 @@ class PARSeq(nn.Module):
         tgt_query = self.dropout(tgt_query)
         return self.decoder(tgt_query, tgt_emb, memory, tgt_query_mask, tgt_mask, tgt_padding_mask)
 
-    def forward(self, tokenizer: Tokenizer, images: Tensor, max_length: Optional[int] = None) -> Tensor:
+    def forward(self, images: Tensor, max_length: Optional[int] = None) -> Tensor:
         testing = max_length is None
         max_length = self.max_label_length if max_length is None else min(max_length, self.max_label_length)
         bs = images.shape[0]
@@ -114,11 +116,11 @@ class PARSeq(nn.Module):
         pos_queries = self.pos_queries[:, :num_steps].expand(bs, -1, -1)
 
         # Special case for the forward permutation. Faster than using `generate_attn_masks()`
-        tgt_mask = query_mask = torch.triu(torch.ones((num_steps, num_steps), dtype=torch.bool, device=self._device), 1)
+        tgt_mask = query_mask = torch.triu(torch.ones((num_steps, num_steps), dtype=torch.bool, device=self.get_device()), 1)
 
         if self.decode_ar:
-            tgt_in = torch.full((bs, num_steps), tokenizer.pad_id, dtype=torch.long, device=self._device)
-            tgt_in[:, 0] = tokenizer.bos_id
+            tgt_in = torch.full((bs, num_steps), self.pad_id, dtype=torch.long, device=self.get_device())
+            tgt_in[:, 0] = self.bos_id
 
             logits = []
             for i in range(num_steps):
@@ -141,26 +143,26 @@ class PARSeq(nn.Module):
                     # greedy decode. add the next token index to the target input
                     tgt_in[:, j] = p_i.squeeze().argmax(-1)
                     # Efficient batch decoding: If all output words have at least one EOS token, end decoding.
-                    if testing and (tgt_in == tokenizer.eos_id).any(dim=-1).all():
+                    if testing and (tgt_in == self.eos_id).any(dim=-1).all():
                         break
 
             logits = torch.cat(logits, dim=1)
         else:
             # No prior context, so input is just <bos>. We query all positions.
-            tgt_in = torch.full((bs, 1), tokenizer.bos_id, dtype=torch.long, device=self._device)
+            tgt_in = torch.full((bs, 1), self.bos_id, dtype=torch.long, device=self.get_device())
             tgt_out = self.decode(tgt_in, memory, tgt_query=pos_queries)
             logits = self.head(tgt_out)
 
         if self.refine_iters:
             # For iterative refinement, we always use a 'cloze' mask.
             # We can derive it from the AR forward mask by unmasking the token context to the right.
-            query_mask[torch.triu(torch.ones(num_steps, num_steps, dtype=torch.bool, device=self._device), 2)] = 0
-            bos = torch.full((bs, 1), tokenizer.bos_id, dtype=torch.long, device=self._device)
+            query_mask[torch.triu(torch.ones(num_steps, num_steps, dtype=torch.bool, device=self.get_device()), 2)] = 0
+            bos = torch.full((bs, 1), self.bos_id, dtype=torch.long, device=self.get_device())
             for i in range(self.refine_iters):
                 # Prior context is the previous output.
                 tgt_in = torch.cat([bos, logits[:, :-1].argmax(-1)], dim=1)
                 # Mask tokens beyond the first EOS token.
-                tgt_padding_mask = (tgt_in == tokenizer.eos_id).int().cumsum(-1) > 0
+                tgt_padding_mask = (tgt_in == self.eos_id).int().cumsum(-1) > 0
                 tgt_out = self.decode(
                     tgt_in, memory, tgt_mask, tgt_padding_mask, pos_queries, query_mask[:, : tgt_in.shape[1]]
                 )

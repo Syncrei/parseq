@@ -16,7 +16,7 @@
 import re
 from abc import ABC, abstractmethod
 from itertools import groupby
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from torch import Tensor
@@ -43,7 +43,6 @@ class CharsetAdapter:
 
 
 class BaseTokenizer(ABC):
-
     def __init__(self, charset: str, specials_first: tuple = (), specials_last: tuple = ()) -> None:
         self._itos = specials_first + tuple(charset) + specials_last
         self._stoi = {s: i for i, s in enumerate(self._itos)}
@@ -54,7 +53,7 @@ class BaseTokenizer(ABC):
     def _tok2ids(self, tokens: str) -> list[int]:
         return [self._stoi[s] for s in tokens]
 
-    def _ids2tok(self, token_ids: list[int], join: bool = True) -> str:
+    def _ids2tok(self, token_ids: list[int], join: bool = True) -> str | List[str]:
         tokens = [self._itos[i] for i in token_ids]
         return ''.join(tokens) if join else tokens
 
@@ -99,14 +98,16 @@ class BaseTokenizer(ABC):
         return batch_tokens, batch_probs
 
 
-class Tokenizer(BaseTokenizer):
+class TokenizerSpecialTokens:
     BOS = '[B]'
     EOS = '[E]'
     PAD = '[P]'
 
+
+class Tokenizer(BaseTokenizer):
     def __init__(self, charset: str) -> None:
-        specials_first = (self.EOS,)
-        specials_last = (self.BOS, self.PAD)
+        specials_first = (TokenizerSpecialTokens.EOS,)
+        specials_last = (TokenizerSpecialTokens.BOS, TokenizerSpecialTokens.PAD)
         super().__init__(charset, specials_first, specials_last)
         self.eos_id, self.bos_id, self.pad_id = [self._stoi[s] for s in specials_first + specials_last]
 
@@ -119,10 +120,7 @@ class Tokenizer(BaseTokenizer):
 
     def _filter(self, probs: Tensor, ids: Tensor) -> tuple[Tensor, list[int]]:
         ids = ids.tolist()
-        try:
-            eos_idx = ids.index(self.eos_id)
-        except ValueError:
-            eos_idx = len(ids)  # Nothing to truncate.
+        eos_idx = ids.index(self.eos_id) if self.eos_id in ids else len(ids)
         # Truncate after EOS
         ids = ids[:eos_idx]
         probs = probs[: eos_idx + 1]  # but include prob. for EOS (if it exists)
