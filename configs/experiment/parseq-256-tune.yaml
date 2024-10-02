@@ -11,6 +11,7 @@ model:
   # For charset_test, ordering doesn't matter.
   charset_test: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~° "
   batch_size: 200
+  lr: 5e-5
 
 data:
   train_dir: "custom"
@@ -21,7 +22,7 @@ data:
 trainer:
   devices: 1
   val_check_interval: 50
-  max_epochs: 5
+  max_epochs: 15
 
 pretrained_path: "model_weights/parseq_base_checkpoint.ckpt"
 # pretrained: true
